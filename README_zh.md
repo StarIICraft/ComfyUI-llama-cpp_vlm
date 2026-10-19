@@ -1,9 +1,13 @@
 # ComfyUI-llama-cpp
 在 ComfyUI 中基于 llama.cpp 框架原生运行 LLM & VLM 模型。  
+
+该分支增加了10张图像多图识别，改进的模型自动卸载，输入图像百万像素限制
+
 **[[📃English](./README.md)]**   
 
 ## 预览
-![](./img/preview.jpg) 
+<img width="1887" height="1631" alt="image" src="https://github.com/user-attachments/assets/3aff4452-4bfb-432c-bcb6-dbee51a2abf8" />
+
 
 ## 安装步骤
 
