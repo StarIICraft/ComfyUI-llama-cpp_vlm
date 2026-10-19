@@ -1,61 +1,54 @@
+# ComfyUI-llama-cpp
 
-# ComfyUI-llama-cpp本地与 API 大模型工具
+在 ComfyUI 中运行本地 LLM/VLM，并调用 OpenAI 兼容 API。
 
-为 ComfyUI 提供 llama.cpp 本地推理与 OpenAI 兼容 API 调用，支持文本、多图分析和提示词增强。
+**[English](./README.md)**
+<img width="1980" height="1888" alt="image" src="https://github.com/user-attachments/assets/316cacab-98f9-4367-80d6-67640c2106bf" />
 
-## 主要功能
+## 功能
 
-### 本地推理
-- 加载 GGUF 模型及 mmproj 视觉投影文件。
-- 多图合并、逐组分析、视频帧采样。
-- 上下文长度、采样参数和图片像素限制。
-- 对话状态保存、清理及模型卸载策略。
-- JSON 解析、边界框绘制、MASK 与 SEGS 转换。
-- 提示词增强预设及实验性文本编码器。
+### 本地模型
+- 基于 llama.cpp 加载 GGUF 模型，视觉推理需匹配的 mmproj。
+- 提供 10 个图片输入接口，每个支持单图或图片批次。
+- 支持逐组、多图合并及视频帧采样推理。
+- 支持图片像素限制、模型自动卸载和文本对话状态。
+- 提供边界框、遮罩、JSON 处理及实验性文本编码器。
 
-模型支持取决于所安装的 llama-cpp-python 版本和对应 Handler。
+### API 模型
+- 提供 API 加载器与通用链路两个节点。
+- 支持模型列表刷新、多图合并、逐组推理及回复列表。
+- 支持 Tavily 联网搜索和 SSE 流式响应。
+- 流式正文显示在后端控制台，节点结束后输出完整结果。
 
-### API 推理
-- OpenAI 兼容接口及模型列表刷新。
-- 纯文本、多图合并、逐组推理。
-- SSE 流式响应：实时正文显示在后端控制台。
-- Tavily 联网搜索，密钥从本地配置读取。
+## 安装
 
-## 安装与配置
-
-将插件放入 `ComfyUI/custom_nodes/`，安装所需依赖后重启。
-
-本地模型与 mmproj 放入 `ComfyUI/models/LLM/`，选择匹配的视觉 Handler。
-
-联网搜索需在插件目录创建 `search_config.json`：
-
-```json
-{"tavily_api_key": "你的密钥", "max_results": 5}
-
-
-**[[📃English](./README.md)]**   
-
-## 预览
-<img width="1887" height="1631" alt="image" src="https://github.com/user-attachments/assets/3aff4452-4bfb-432c-bcb6-dbee51a2abf8" />
-
-
-## 安装步骤
-
-#### 安装节点:
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/lihaoyun6/ComfyUI-llama-cpp.git
 python -m pip install -r ComfyUI-llama-cpp/requirements.txt
-#CUDA 13用户请执行:
-#python -m pip install -r ComfyUI-llama-cpp/requirements_cu131.txt
 ```
 
-### 模型路径:
-- 请将下载的 `.gguf` 模型放置在 `ComfyUI/models/LLM` 目录中.  
+CUDA 13 用户可改用 `requirements_cu131.txt`。请使用 ComfyUI 对应的 Python 环境安装依赖，完成后重启并刷新浏览器。
 
-	> 在使用VLM模型进行图像推理之前, 请确保已经下载并选择了主模型对应的`mmproj`权重文件.
+## 配置
+
+本地模型放入 `ComfyUI/models/LLM`，视觉模型需选择对应 mmproj。
+
+API 加载器填写基础地址、密钥和模型名称；地址不要包含 `/chat/completions`。
+
+联网搜索启用前，在插件目录创建 `search_config.json`：
+
+```json
+{
+  "tavily_api_key": "你的搜索密钥",
+  "max_results": 5
+}
+```
+
+## 注意
+
+同一图片批次视为一组，10 个接口不代表最多 10 张。API 多图能力取决于服务及模型。搜索会向 Tavily 发送关键词，图片与提示词会发送给模型服务。分享工作流前清除密钥，勿上传搜索配置。
 
 ## 致谢
-- [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) @JamePeng  
-- [ComfyUI-llama-cpp](https://github.com/kijai/ComfyUI-llama-cpp) @kijai
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) @comfyanonymous
+
+[llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) · [原项目](https://github.com/kijai/ComfyUI-llama-cpp) · [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
