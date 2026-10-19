@@ -24,7 +24,7 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/lihaoyun6/ComfyUI-llama-cpp.git
+git clone https://github.com/StarIICraft/ComfyUI-llama-cpp_vlm.git
 python -m pip install -r ComfyUI-llama-cpp/requirements.txt
 ```
 
