@@ -2,8 +2,11 @@
 # ComfyUI-llama-cpp
 
 Run local LLM/VLM models and access OpenAI-compatible APIs in ComfyUI.
-<img width="1980" height="1888" alt="image" src="https://github.com/user-attachments/assets/8b5383ae-cd45-4568-8e48-7d4157ebeea6" />
+
 **[中文版](./README_zh.md)**
+
+<img width="1976" height="1654" alt="image" src="https://github.com/user-attachments/assets/20d16bea-db9e-462d-98b4-ae817512d307" />
+
 
 ## Features
 
