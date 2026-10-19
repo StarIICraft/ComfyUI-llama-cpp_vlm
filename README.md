@@ -25,6 +25,9 @@ Run local LLM/VLM models and access OpenAI-compatible APIs in ComfyUI.
 
 ## Installation
 
+```Wheel
+https://github.com/JamePeng/llama-cpp-python/releases
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/StarIICraft/ComfyUI-llama-cpp_vlm.git
