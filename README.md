@@ -1,68 +1,66 @@
-# ComfyUI-llama-cpp Local and API Large Model Tools
 
-```markdown
-# ComfyUI Local & API LLM Tools
+# ComfyUI-llama-cpp
 
-Local llama.cpp inference and OpenAI-compatible API access for ComfyUI, with text generation, multi-image analysis, and prompt enhancement.
+Run local LLM/VLM models and access OpenAI-compatible APIs in ComfyUI.
+<img width="1980" height="1888" alt="image" src="https://github.com/user-attachments/assets/8b5383ae-cd45-4568-8e48-7d4157ebeea6" />
+**[中文版](./README_zh.md)**
 
 ## Features
 
-### Local Inference
-- GGUF models and mmproj vision projectors.
-- Combined-image, per-group, and sampled video-frame inference.
-- Context, sampling, and image-resolution controls.
-- Conversation state management and model unloading policies.
-- JSON parsing, bounding-box visualization, MASK and SEGS conversion.
-- Prompt presets and an experimental text encoder.
+### Local Models
+- Load GGUF models through llama.cpp; vision inference requires matching mmproj weights.
+- Ten image inputs, each accepting a single image or an IMAGE batch.
+- Group-by-group, combined-image, and sampled video-frame inference.
+- Per-image megapixel limits, automatic model unloading, and conversation state.
+- Bounding-box, mask, JSON utilities, and an experimental text encoder.
 
-Model compatibility depends on your installed llama-cpp-python version and available chat handlers.
+### API Models
+- Two nodes: API LLM Loader and API LLM General Chain.
+- Model-list refresh, combined-image inference, group-by-group inference, and string-list output.
+- Tavily web search and SSE streaming.
+- Streamed text appears in the backend console; nodes return complete results after generation.
 
-### API Inference
-- OpenAI-compatible Chat Completions.
-- Model-list refresh and selection.
-- Text-only and multi-image requests.
-- Combined-image or per-group processing.
-- SSE streaming to the backend console; complete outputs are returned when generation finishes.
-- Tavily web search with file-based credentials.
+## Installation
 
-## Setup
-
-Place the plugin in `ComfyUI/custom_nodes/`, install its required dependencies, and restart ComfyUI.
-
-Store local models and projectors in:
-
-`ComfyUI/models/LLM/`
-
-Select a matching model, projector, and vision handler.
-
-For web search, create `search_config.json` in the plugin directory:
-
-```json
-{"tavily_api_key": "YOUR_KEY", "max_results": 5}
-
-**[[📃中文版](./README_zh.md)]** 
-
-## Preview  
-<img width="1887" height="1631" alt="image" src="https://github.com/user-attachments/assets/5729dde2-8336-4f87-8c4d-188351f7c734" />
-
-
-## Installation  
-
-#### Install the node:  
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/lihaoyun6/ComfyUI-llama-cpp.git
 python -m pip install -r ComfyUI-llama-cpp/requirements.txt
-#For CUDA 13, please run:
-#python -m pip install -r ComfyUI-llama-cpp/requirements_cu131.txt
 ```
 
-#### Download models:  
-- Place your model files in the `ComfyUI/models/LLM` folder.  
+CUDA 13 users can use `requirements_cu131.txt` instead. Install dependencies with your ComfyUI Python environment, restart ComfyUI, and refresh the browser.
 
-	> If you need a VLM model to process image input, don't forget to download the `mmproj` weights.
+## Configuration
 
-## Credits  
-- [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) @JamePeng  
-- [ComfyUI-llama-cpp](https://github.com/kijai/ComfyUI-llama-cpp) @kijai  
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) @comfyanonymous
+### Local Inference
+Place GGUF files in `ComfyUI/models/LLM`. For vision models, select the corresponding mmproj file.
+
+### API Inference
+Enter the base URL, API key, and model name in the API loader. Do not include `/chat/completions` in the base URL.
+
+### Web Search
+Create `search_config.json` in the plugin directory:
+
+```json
+{
+  "tavily_api_key": "YOUR_SEARCH_KEY",
+  "max_results": 5
+}
+```
+
+Search settings are reloaded when search runs.
+
+## Notes
+
+- Each IMAGE batch counts as one group. Ten inputs do not mean a ten-image limit.
+- Multi-image support and request limits depend on the API provider and model.
+- Search sends keywords to Tavily; prompts and images are sent to your model provider.
+- Remove API keys before sharing workflows. Never publish your search configuration.
+- API nodes currently use Chinese interface labels.
+- This combined plugin still requires its local-model dependencies.
+
+## Credits
+
+- [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) — @JamePeng
+- [ComfyUI-llama-cpp](https://github.com/kijai/ComfyUI-llama-cpp) — @kijai
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) — @comfyanonymous
