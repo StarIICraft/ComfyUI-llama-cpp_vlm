@@ -1,7 +1,44 @@
 # ComfyUI-llama-cpp  
-Run LLM/VLM models natively in ComfyUI based on llama.cpp  
 
-This branch adds multi-image recognition for up to 10 images, improved automatic model unloading, and a megapixel limit for input images.
+```markdown
+# ComfyUI Local & API LLM Tools
+
+Local llama.cpp inference and OpenAI-compatible API access for ComfyUI, with text generation, multi-image analysis, and prompt enhancement.
+
+## Features
+
+### Local Inference
+- GGUF models and mmproj vision projectors.
+- Combined-image, per-group, and sampled video-frame inference.
+- Context, sampling, and image-resolution controls.
+- Conversation state management and model unloading policies.
+- JSON parsing, bounding-box visualization, MASK and SEGS conversion.
+- Prompt presets and an experimental text encoder.
+
+Model compatibility depends on your installed llama-cpp-python version and available chat handlers.
+
+### API Inference
+- OpenAI-compatible Chat Completions.
+- Model-list refresh and selection.
+- Text-only and multi-image requests.
+- Combined-image or per-group processing.
+- SSE streaming to the backend console; complete outputs are returned when generation finishes.
+- Tavily web search with file-based credentials.
+
+## Setup
+
+Place the plugin in `ComfyUI/custom_nodes/`, install its required dependencies, and restart ComfyUI.
+
+Store local models and projectors in:
+
+`ComfyUI/models/LLM/`
+
+Select a matching model, projector, and vision handler.
+
+For web search, create `search_config.json` in the plugin directory:
+
+```json
+{"tavily_api_key": "YOUR_KEY", "max_results": 5}
 
 **[[📃中文版](./README_zh.md)]** 
 
