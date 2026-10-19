@@ -7,6 +7,7 @@ import base64
 import random
 import torch
 import inspect
+import math
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -120,6 +121,20 @@ class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
 
+UNLOAD_AUTO = "自动"
+UNLOAD_KEEP = "保持加载"
+UNLOAD_AFTER = "运行后自动卸载"
+UNLOAD_BEFORE_AFTER = "运行前后自动卸载"
+
+UNLOAD_MODES = [
+    UNLOAD_AUTO,
+    UNLOAD_KEEP,
+    UNLOAD_AFTER,
+    UNLOAD_BEFORE_AFTER,
+]
+
+DEFAULT_MAX_MEGAPIXELS = 0.5
+
 class LLAMA_CPP_STORAGE:
     llm = None
     chat_handler = None
@@ -183,26 +198,352 @@ class LLAMA_CPP_STORAGE:
         
     @classmethod
     def clean(cls, all=False):
-        try:
-            if cls.llm:
-                cls.llm.close()
-        except Exception:
-            pass
-            
-        try:
-            if cls.chat_handler and hasattr(cls.chat_handler, "_exit_stack"):
-                cls.chat_handler._exit_stack.close()
-        except Exception:
-            pass
-        
+        """
+        释放当前 llama.cpp 模型及视觉 Handler。
+
+        all=False：
+            保留 Python 中保存的文本对话记录。
+
+        all=True：
+            同时清除文本对话记录。
+        """
+        llm = cls.llm
+        handler = cls.chat_handler
+
+        # 先取消全局引用，避免后续误用已经关闭的对象。
         cls.llm = None
         cls.chat_handler = None
         cls.current_config = None
+        cls.current_embedding_mode = False
+
+        try:
+            if llm is not None:
+                close = getattr(llm, "close", None)
+
+                if callable(close):
+                    close()
+        except Exception as error:
+            print(
+                "[llama-cpp_vlm] "
+                f"关闭模型时出现提示：{error}"
+            )
+
+        # 先关闭视觉 Handler，避免 Handler 仍然引用底层 Context。
+        if handler is not None:
+            try:
+                close = getattr(
+                    handler,
+                    "close",
+                    None,
+                )
+
+                if callable(close):
+                    close()
+                else:
+                    exit_stack = getattr(
+                        handler,
+                        "_exit_stack",
+                        None,
+                    )
+
+                    if exit_stack is not None:
+                        exit_stack.close()
+
+            except Exception as error:
+                print(
+                    "[llama-cpp_vlm] "
+                    f"关闭视觉 Handler 时出现提示：{error}"
+                )
+
+        # 再关闭 llama.cpp 模型。
+        if llm is not None:
+            try:
+                close = getattr(
+                    llm,
+                    "close",
+                    None,
+                )
+
+                if callable(close):
+                    close()
+
+            except Exception as error:
+                print(
+                    "[llama-cpp_vlm] "
+                    f"关闭模型时出现提示：{error}"
+                )
+
         if all:
             cls.clean_state()
-        
+
+        del llm
+        del handler
+
         gc.collect()
-        mm.soft_empty_cache()
+
+        try:
+            mm.soft_empty_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def release_cuda_cache():
+        """
+        与参考运行时一致：
+        释放 PyTorch 未使用的 CUDA 缓存。
+
+        注意：这不能代替 llama.cpp 模型本身的 close()。
+        """
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+                ipc_collect = getattr(
+                    torch.cuda,
+                    "ipc_collect",
+                    None,
+                )
+
+                if callable(ipc_collect):
+                    ipc_collect()
+        except Exception:
+            pass
+
+    @staticmethod
+    def memory_snapshot():
+        """
+        返回 ComfyUI 当前计算设备的：
+            (可用内存字节数, 总内存字节数)
+
+        GPU 模式通常对应显存；
+        CPU 模式可能对应系统内存。
+        """
+        try:
+            device = mm.get_torch_device()
+
+            free = int(
+                mm.get_free_memory(device)
+            )
+
+            total = int(
+                mm.get_total_memory(device)
+            )
+
+            return free, total
+
+        except Exception:
+            return 0, 0
+
+    @staticmethod
+    def estimated_model_memory(config):
+        """
+        按参考运行时：
+        (主模型文件大小 + mmproj 文件大小) × 1.25。
+
+        这只是粗略估算，不包含精确的 KV Cache 和运行时开销。
+        """
+        total = 0
+
+        for key in ("model", "mmproj"):
+            name = config.get(key)
+
+            if not name or name == "None":
+                continue
+
+            path = os.path.join(
+                folder_paths.models_dir,
+                "LLM",
+                name,
+            )
+
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                continue
+
+        return int(total * 1.25)
+
+    @staticmethod
+    def unload_other_comfy_models():
+        """
+        释放 ComfyUI 管理的其他模型。
+
+        不调用 unload_all_models()，
+        避免触发本文件已有的全局卸载 Hook，
+        导致当前 llama.cpp 模型也被一起清除。
+        """
+        loaded_models = getattr(
+            mm,
+            "current_loaded_models",
+            None,
+        )
+
+        if loaded_models is not None and not loaded_models:
+            return
+
+        try:
+            devices = mm.get_all_torch_devices()
+        except Exception:
+            try:
+                devices = [mm.get_torch_device()]
+            except Exception:
+                return
+
+        for device in devices:
+            try:
+                mm.free_memory(
+                    1e30,
+                    device,
+                )
+            except Exception as error:
+                print(
+                    "[llama-cpp_vlm] "
+                    f"释放 ComfyUI 模型时出现提示：{error}"
+                )
+
+    @classmethod
+    def prepare_unload_mode(cls, unload_mode, config):
+        """
+        对齐参考运行时的运行前策略：
+
+        1. 释放未使用的 CUDA 缓存。
+        2. 当前配置已经加载时直接复用。
+        3. 否则满足下面任一条件时，尝试释放其他 ComfyUI 模型：
+           - 运行前后自动卸载；
+           - 预计所需内存大于当前可用内存。
+
+        注意：
+        即使是“保持加载”，参考运行时也会在加载前内存不足时
+        尝试释放其他 ComfyUI 模型。
+        """
+        cls.release_cuda_cache()
+
+        if (
+            cls.llm is not None
+            and cls.current_config == config
+        ):
+            return
+
+        free, _ = cls.memory_snapshot()
+
+        required = cls.estimated_model_memory(
+            config
+        )
+
+        should_release = (
+            unload_mode == UNLOAD_BEFORE_AFTER
+        )
+
+        should_release = should_release or (
+            required > 0
+            and free > 0
+            and free < required
+        )
+
+        if should_release:
+            print(
+                "[llama-cpp_vlm] "
+                "加载前释放其他 ComfyUI 模型..."
+            )
+
+            cls.unload_other_comfy_models()
+            cls.release_cuda_cache()
+
+    @classmethod
+    def clear_inference_cache(cls):
+        """
+        清除本次推理的上下文缓存，不删除 Python 文本对话记录。
+        """
+        llm = cls.llm
+
+        if llm is None:
+            return
+
+        try:
+            if hasattr(llm, "n_tokens"):
+                llm.n_tokens = 0
+        except Exception:
+            pass
+
+        ctx = getattr(llm, "_ctx", None)
+
+        if ctx is not None:
+            for name, args in (
+                ("kv_cache_clear", ()),
+                ("memory_clear", (True,)),
+            ):
+                method = getattr(ctx, name, None)
+
+                if not callable(method):
+                    continue
+
+                try:
+                    method(*args)
+                    break
+                except Exception:
+                    continue
+
+        # 保留你原来对 Qwen 混合架构缓存的额外处理。
+        hybrid_cache = getattr(
+            llm,
+            "_hybrid_cache_mgr",
+            None,
+        )
+
+        if (
+            getattr(llm, "is_hybrid", False)
+            and hybrid_cache is not None
+        ):
+            try:
+                hybrid_cache.clear()
+            except Exception:
+                pass
+
+    @classmethod
+    def finish_unload_mode(cls, unload_mode):
+        """
+        对齐参考运行时的运行后策略。
+
+        自动：
+            可用内存 < 总内存 50% 时卸载。
+
+        保持加载：
+            只清理上下文缓存。
+
+        运行后自动卸载 / 运行前后自动卸载：
+            卸载当前 llama.cpp 模型。
+        """
+        cls.clear_inference_cache()
+
+        should_unload = unload_mode in {
+            UNLOAD_AFTER,
+            UNLOAD_BEFORE_AFTER,
+        }
+
+        if unload_mode == UNLOAD_AUTO:
+            free, total = cls.memory_snapshot()
+
+            should_unload = bool(
+                total > 0
+                and free * 2 < total
+            )
+
+            if total > 0:
+                print(
+                    "[llama-cpp_vlm] "
+                    "自动卸载判断："
+                    f"可用 {free / (1024 ** 3):.2f} GiB / "
+                    f"总计 {total / (1024 ** 3):.2f} GiB，"
+                    f"卸载={should_unload}"
+                )
+
+        if should_unload:
+            print(
+                "[llama-cpp_vlm] "
+                f"运行后卸载模型，策略：{unload_mode}"
+            )
+
+            cls.clean(all=False)
     
     @classmethod
     def load_model(cls, config):
@@ -257,8 +598,26 @@ class LLAMA_CPP_STORAGE:
                 case _:
                     raise ValueError(f'Unknown model type: "{chat_handler}"')
         
-        cls.clean(all=True)
-        cls.current_config = config.copy()
+        # Loader 节点可能先于 Instruct 节点加载模型。
+        # 因此这里也需要执行“预计内存不足则释放其他模型”的逻辑。
+        cls.prepare_unload_mode(
+            UNLOAD_KEEP,
+            config,
+        )
+
+        previous_config = cls.current_config
+
+        # 卸载后重新加载相同配置时，保留已保存的文本对话。
+        # 真正从另一套已加载配置切换时，则清除旧对话。
+        clear_history = (
+            previous_config is not None
+            and previous_config != config
+        )
+
+        cls.clean(all=clear_history)
+
+        # 只有模型成功加载后才正式写入 current_config。
+        cls.current_config = None
         model = config["model"]
         mmproj = config["mmproj"]
         chat_handler = config["chat_handler"]
@@ -332,7 +691,17 @@ class LLAMA_CPP_STORAGE:
             if load_mtp:
                 raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
             
-        cls.llm = Llama(**kwargs)
+        try:
+            new_llm = Llama(**kwargs)
+
+        except Exception:
+            # 加载失败时清理可能已经创建的 Handler。
+            cls.clean(all=False)
+            raise
+
+        cls.llm = new_llm
+        cls.current_config = config.copy()
+        cls.current_embedding_mode = False
 
 any_type = AnyType("*")
 
@@ -364,10 +733,26 @@ preset_prompts = {
 preset_tags = list(preset_prompts.keys())
 
 def image2base64(image):
+    """
+    将 NumPy 图片编码为 JPEG Base64。
+    """
     img = Image.fromarray(image)
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
     buffered = io.BytesIO()
-    img.save(buffered, format="JPEG", quality=85)
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+    img.save(
+        buffered,
+        format="JPEG",
+        quality=85,
+        optimize=False,
+    )
+
+    return base64.b64encode(
+        buffered.getvalue()
+    ).decode("ascii")
 
 def parse_json(json_str):
     json_output = json_str.strip()
@@ -384,16 +769,138 @@ def parse_json(json_str):
         raise ValueError(f"Unable to load JSON data!\n{e}")
     return parsed
 
-def scale_image(image: torch.Tensor, max_size: int = 128):
-    img_np = np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
-    img_pil = Image.fromarray(img_np)
-    
-    w, h = img_pil.size
-    scale = min(max_size / max(w, h), 1.0)
-    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-    img_resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    return np.array(img_resized)
+def scale_image(
+    image: torch.Tensor,
+    max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
+):
+    """
+    按百万像素上限处理单张图片。
+
+    支持：
+        [H, W, C]
+        [1, H, W, C]
+
+    例如：
+        0.5 = 500,000 像素
+        1.0 = 1,000,000 像素
+
+    未超限不缩放，超限后使用 Lanczos 等比例缩小。
+    不放大图片。
+    """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(
+            "图像必须为 torch.Tensor。"
+        )
+
+    if image.ndim == 4:
+        if image.shape[0] != 1:
+            raise ValueError(
+                "scale_image() 只能处理单张图像，"
+                f"收到：{tuple(image.shape)}"
+            )
+
+        image = image[0]
+
+    if image.ndim != 3:
+        raise ValueError(
+            "图像需要为 [H, W, C]，"
+            f"收到：{tuple(image.shape)}"
+        )
+
+    if image.shape[-1] not in (1, 3, 4):
+        raise ValueError(
+            f"不支持的图像通道数：{image.shape[-1]}"
+        )
+
+    max_megapixels = float(max_megapixels)
+
+    if (
+        not math.isfinite(max_megapixels)
+        or max_megapixels <= 0
+    ):
+        raise ValueError(
+            "百万像素限制必须是大于 0 的有限数值。"
+        )
+
+    array = (
+        image.detach()
+        .cpu()
+        .float()
+        .clamp(0.0, 1.0)
+        .numpy()
+    )
+
+    # 只保留 RGB，避免 RGBA 直接转 JPEG 时出错。
+    array = (
+        array[..., :3] * 255.0 + 0.5
+    ).astype(np.uint8)
+
+    pil = Image.fromarray(
+        array,
+        mode="RGB",
+    )
+
+    width, height = pil.size
+
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "图像宽高必须大于 0。"
+        )
+
+    max_pixels = max(
+        1,
+        int(max_megapixels * 1_000_000),
+    )
+
+    current_pixels = width * height
+
+    # 未超过限制时，不调用 resize。
+    if current_pixels <= max_pixels:
+        return np.asarray(pil)
+
+    scale = math.sqrt(
+        max_pixels / current_pixels
+    )
+
+    new_width = max(
+        1,
+        min(
+            width,
+            round(width * scale),
+        ),
+    )
+
+    new_height = max(
+        1,
+        min(
+            height,
+            round(height * scale),
+        ),
+    )
+
+    # 由于 round() 可能导致少量超出，再做一次修正。
+    while new_width * new_height > max_pixels:
+        if new_width >= new_height:
+            new_width = max(
+                1,
+                new_width - 1,
+            )
+        else:
+            new_height = max(
+                1,
+                new_height - 1,
+            )
+
+    if (
+        new_width != width
+        or new_height != height
+    ):
+        pil = pil.resize(
+            (new_width, new_height),
+            Image.Resampling.LANCZOS,
+        )
+
+    return np.asarray(pil)
 
 def qwen3bbox(image, json_data):
     img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
@@ -494,291 +1001,1117 @@ class llama_cpp_model_loader:
             LLAMA_CPP_STORAGE.load_model(custom_config)
         return (custom_config,)
 
+def collect_instruct_images(images=None, extra_inputs=None):
+    """
+    按输入接口顺序收集图片。
+
+    支持：
+        - 单张 IMAGE：[H, W, C]
+        - IMAGE Batch：[B, H, W, C]
+        - INPUT_IS_LIST=True 产生的列表包装
+        - 上游节点产生的嵌套列表
+
+    返回值中的每个元素保持原始 Tensor：
+        [H, W, C] 或 [B, H, W, C]
+
+    不在此处拆分 batch，以便后续根据 inference_mode
+    决定 batch 是多图、视频帧，还是独立输入组。
+    """
+    collected = []
+    extra_inputs = extra_inputs or {}
+
+    def visit(value, input_name):
+        if value is None:
+            return
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, input_name)
+            return
+
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"图像输入 {input_name} 收到不支持的类型："
+                f"{type(value).__name__}。"
+                "需要 ComfyUI IMAGE Tensor。"
+            )
+
+        if value.ndim not in (3, 4):
+            raise ValueError(
+                f"图像输入 {input_name} 的形状无效："
+                f"{tuple(value.shape)}。"
+                "需要 [H, W, C] 或 [B, H, W, C]。"
+            )
+
+        if value.ndim == 4 and value.shape[0] == 0:
+            return
+
+        if value.shape[-3] <= 0 or value.shape[-2] <= 0:
+            raise ValueError(
+                f"图像输入 {input_name} 的宽高无效："
+                f"{tuple(value.shape)}"
+            )
+
+        collected.append(value)
+
+    # 原有接口，必须保留以兼容旧工作流。
+    visit(images, "images")
+
+    # 新增接口，按照 images_02 到 images_10 的顺序收集。
+    for index in range(2, 11):
+        input_name = f"images_{index:02d}"
+        visit(extra_inputs.get(input_name), input_name)
+
+    return collected
+
+def frame_to_data_url(
+    frame,
+    max_megapixels=DEFAULT_MAX_MEGAPIXELS,
+):
+    """
+    按每张图片的百万像素上限缩小，再编码为 JPEG data URL。
+    """
+    frame_np = scale_image(
+        image=frame,
+        max_megapixels=max_megapixels,
+    )
+
+    encoded = image2base64(frame_np)
+
+    return f"data:image/jpeg;base64,{encoded}"
+    
 class llama_cpp_instruct_adv:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "llama_model": ("LLAMACPPMODEL",),
-                "preset_prompt": (preset_tags, {"default": preset_tags[1]}),
-                "custom_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": 'user_prompt\n\nFor preset hints marked with an "*", this will be used to fill the placeholder (e.g., Object names in BBox detection)\nOtherwise, this will override the preset prompts.'}),
-                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "inference_mode": (["one by one", "images", "video"], {
-                    "default": "one by one",
-                    "tooltip": "one by one: Process each item in the input list one by one (multi-image batch inside an item will be inferred together)\nimages:  \tCombine ALL images across all list items into 1 single prompt\nvideo:  \tTreat each image item in the list as a separate video clip"
-                }),
-                "max_frames": ("INT", {
-                    "default": 24,
-                    "min": 2,
-                    "max": 1024,
-                    "step": 1,
-                    "tooltip": 'Number of frames to sample evenly from input video.\n(for "video" mode only)'
-                }),
-                "max_size": ("INT", {
-                    "default": 256,
-                    "min": 128,
-                    "max": 16384,
-                    "step": 64,
-                    "tooltip": 'Max size of input images in "images" and "video" modes.'
-                }),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
-                "force_offload": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Unload the model after inference."
-                }),
-                "save_states": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Preserve the context of this conversation in RAM."
-                }),
+
+                "preset_prompt": (
+                    preset_tags,
+                    {
+                        "default": preset_tags[1],
+                    },
+                ),
+
+                "custom_prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "placeholder": (
+                            "用户提示词\n\n"
+                            "如果预设提示词中包含 '*', "
+                            "这里的内容将用于填充占位符 "
+                            "(例如目标检测中的对象名称。).\n"
+                            "其他情况下，这里的内容会覆盖预设提示词。."
+                        ),
+                    },
+                ),
+
+                "system_prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": (
+                            "可选的系统提示词 "
+                            "留空时不添加额外系统提示词."
+                        ),
+                    },
+                ),
+
+                "inference_mode": (
+                    [
+                        "one by one",
+                        "images",
+                        "video",
+                    ],
+                    {
+                        "default": "one by one",
+                        "tooltip": (
+                            "逐个处理：每个连接的图像组单独生成一次结果。"
+                            "同一个 IMAGE Batch 会被视为一个图像组 。\n"
+                            "图像合并：将所有连接的图像合并到同一次生成中。\n"
+                            "视频：将每个图像组视为一个独立视频，并按最大帧数均匀采样。"
+                        ),
+                    },
+                ),
+
+                "max_frames": (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 2,
+                        "max": 1024,
+                        "step": 1,
+                        "tooltip": (
+                            "视频模式下每个视频组最多使用的帧数 "
+                            "如果原始帧数超过该值，将进行均匀采样."
+                        ),
+                    },
+                ),
+
+                "max_megapixels": (
+                    "FLOAT",
+                    {
+                        "default": DEFAULT_MAX_MEGAPIXELS,
+                        "min": 0.01,
+                        "max": 256.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "每张图片允许的最大百万像素数。\n"
+                            "默认 0.5 = 500,000 像素。\n"
+                            "每张图片独立计算，未超限不缩放，"
+                            "超限使用 Lanczos 等比例缩小。"
+                        ),
+                    },
+                ),
+
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "step": 1,
+                        "tooltip": (
+                            "随机种子 "
+                            "相同模型、提示词和参数下，尽量保持生成结果一致."
+                        ),                        
+                    },
+                ),
+
+                "unload_mode": (
+                    UNLOAD_MODES,
+                    {
+                        "default": UNLOAD_AUTO,
+                        "tooltip": (
+                            "自动：运行后可用内存不足总量 50% 时卸载。\n"
+                            "保持加载：运行后保留模型。\n"
+                            "运行后自动卸载：结束后卸载当前模型。\n"
+                            "运行前后自动卸载：需要加载模型时先释放"
+                            "其他 ComfyUI 模型，结束后卸载当前模型。\n"
+                            "所有模式在加载前预计内存不足时，"
+                            "都可能释放其他 ComfyUI 模型。"
+                        ),
+                    },
+                ),
+
+                "save_states": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "保存文本对话状态到内存中."
+                            "下一次使用相同状态 ID 时可以继续对话。\n"
+                            "注意：为节省内存，保存状态时不会保留真实图片，"
+                            "图片内容会被替换为占位图。"
+                        ),
+                    },
+                ),
             },
+
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
+
             "optional": {
                 "parameters": ("LLAMACPPARAMS",),
-                "images": ("IMAGE",),
-                "queue_handler": (any_type, {"tooltip": "Used to control the execution order of instruct nodes."}),
+
+                # 保留原来的 images 接口，兼容旧工作流。
+                "images": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "图像输入 1 "
+                            "支持单张 IMAGE 或 IMAGE Batch。"
+                        ),
+                    },
+                ),
+
+                # 新增 images_02 到 images_10。
+                **{
+                    f"images_{index:02d}": (
+                        "IMAGE",
+                        {
+                            "tooltip": (
+                                f"Image input {index}. Supports a single "
+                                "image or an IMAGE batch."
+                            ),
+                        },
+                    )
+                    for index in range(2, 11)
+                },
+
+                "queue_handler": (
+                    any_type,
+                    {
+                        "tooltip": (
+                            "用于控制多个 Instruct 节点的执行顺序。"
+                            "关于指令节点."
+                        ),
+                    },
+                ),
             },
         }
-    
+
     RETURN_TYPES = ("STRING", "STRING", "INT")
     RETURN_NAMES = ("output", "output_list", "state_uid")
     OUTPUT_IS_LIST = (False, True, False)
-    INPUT_IS_LIST = True  # 开启 LIST 支持
+
+    # 必须保留，否则多个 IMAGE 输入不会按照列表形式传入。
+    INPUT_IS_LIST = True
+
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
-    
-    def sanitize_messages(self, messages):
-        clean_messages = json.loads(json.dumps(messages))
-        for msg in clean_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "image_url":
-                        item["image_url"]["url"] = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADElEQVQImWP4//8/AAX+Av5Y8msOAAAAAElFTkSuQmCC"
-        return clean_messages
-    
-    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, queue_handler=None):
-        # 解包 INPUT_IS_LIST 参数
-        llama_model = llama_model[0] if isinstance(llama_model, list) else llama_model
-        preset_prompt = preset_prompt[0] if isinstance(preset_prompt, list) else preset_prompt
-        custom_prompt = custom_prompt[0] if isinstance(custom_prompt, list) else custom_prompt
-        system_prompt = system_prompt[0] if isinstance(system_prompt, list) else system_prompt
-        inference_mode = inference_mode[0] if isinstance(inference_mode, list) else inference_mode
-        max_frames = max_frames[0] if isinstance(max_frames, list) else max_frames
-        max_size = max_size[0] if isinstance(max_size, list) else max_size
-        seed = seed[0] if isinstance(seed, list) else seed
-        force_offload = force_offload[0] if isinstance(force_offload, list) else force_offload
-        save_states = save_states[0] if isinstance(save_states, list) else save_states
-        unique_id = unique_id[0] if isinstance(unique_id, list) else unique_id
-        parameters = parameters[0] if isinstance(parameters, list) and parameters else parameters
 
-        if not LLAMA_CPP_STORAGE.llm:
-            LLAMA_CPP_STORAGE.load_model(llama_model)
-        
-        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
-            
+    @staticmethod
+    def _first(value, default=None):
+        """
+        INPUT_IS_LIST=True 时，普通参数通常会被包装为列表。
+        图像参数不使用这个函数，避免破坏图像输入结构。
+        """
+        if isinstance(value, list):
+            return value[0] if value else default
+        return value if value is not None else default
+
+    @staticmethod
+    def _remove_thinking(text):
+        # Normalize response content.
+        text = str(text or "")
+        text = text.removeprefix(": ").lstrip()
+
+        # Construct tags without writing them literally.
+        open_tag = "<" + "think" + ">"
+        close_tag = "<" + "/think" + ">"
+
+        pattern = (
+            re.escape(open_tag)
+            + r".*?(?:"
+            + re.escape(close_tag)
+            + r"|$)"
+        )
+
+        return re.sub(
+            pattern,
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    def sanitize_messages(self, messages):
+        """
+        保存状态时替换图片 Base64，避免大量图片数据长期占用 RAM。
+
+        注意：
+        这意味着 save_states=True 只保存文本对话结构，
+        不会保存可供下一轮重新视觉识别的真实图片。
+        """
+        clean_messages = json.loads(
+            json.dumps(messages)
+        )
+
+        placeholder = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+            "AAAACXBIWXMAAAsTAAALEwEAmpwYAAAADElEQVQImWP4"
+            "//8/AAX+Av5Y8msOAAAAAElFTkSuQmCC"
+        )
+
+        for message in clean_messages:
+            if not isinstance(message, dict):
+                continue
+
+            content = message.get("content")
+
+            if not isinstance(content, list):
+                continue
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+
+                if item.get("type") != "image_url":
+                    continue
+
+                image_url = item.get("image_url")
+
+                if isinstance(image_url, dict):
+                    image_url["url"] = placeholder
+
+        return clean_messages
+
+    def _append_frame(self, content, frame):
+        """
+        每张图片独立执行百万像素限制。
+        """
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": frame_to_data_url(
+                        frame=frame,
+                        max_megapixels=getattr(
+                            self,
+                            "_max_megapixels",
+                            DEFAULT_MAX_MEGAPIXELS,
+                        ),
+                    ),
+                },
+            }
+        )
+
+    def _create_completion(
+        self,
+        messages,
+        seed,
+        parameters,
+    ):
+        """
+        统一调用 llama.cpp，便于后续维护。
+        """
+        return LLAMA_CPP_STORAGE.llm.create_chat_completion(
+            messages=messages,
+            seed=seed,
+            **parameters,
+        )
+
+    def process(
+        self,
+        llama_model,
+        preset_prompt,
+        custom_prompt,
+        system_prompt,
+        inference_mode,
+        max_frames,
+        seed,
+        save_states,
+        unique_id=-1,
+        parameters=None,
+        images=None,
+        queue_handler=None,
+        unload_mode=None,
+        max_megapixels=DEFAULT_MAX_MEGAPIXELS,
+        force_offload=None,
+        **kwargs,
+    ):
+        """
+        外层执行入口。
+
+        负责：
+            - 解包新增配置；
+            - 运行前内存准备；
+            - 调用原推理逻辑；
+            - 无论成功、失败、中断，都执行运行后策略。
+
+        force_offload：
+            保留给旧 API 参数使用，新界面使用 unload_mode。
+        """
+        config = self._first(
+            llama_model,
+            None,
+        )
+
+        if not isinstance(config, dict):
+            raise ValueError(
+                "llama_model 配置无效，请连接 Model Loader。"
+            )
+
+        selected_unload_mode = self._first(
+            unload_mode,
+            None,
+        )
+
+        # 兼容旧 API 中的 force_offload。
+        if selected_unload_mode is None:
+            legacy_force = bool(
+                self._first(
+                    force_offload,
+                    False,
+                )
+            )
+
+            selected_unload_mode = (
+                UNLOAD_AFTER
+                if legacy_force
+                else UNLOAD_KEEP
+            )
+
+        # 兼容旧布尔值。
+        if isinstance(selected_unload_mode, bool):
+            selected_unload_mode = (
+                UNLOAD_AFTER
+                if selected_unload_mode
+                else UNLOAD_KEEP
+            )
+
+        if selected_unload_mode not in UNLOAD_MODES:
+            raise ValueError(
+                f"未知模型卸载模式：{selected_unload_mode}"
+            )
+
+        megapixels = float(
+            self._first(
+                max_megapixels,
+                DEFAULT_MAX_MEGAPIXELS,
+            )
+        )
+
+        if (
+            not math.isfinite(megapixels)
+            or megapixels <= 0
+        ):
+            raise ValueError(
+                "百万像素限制必须是大于 0 的有限数值。"
+            )
+
+        self._max_megapixels = megapixels
+
+        try:
+            LLAMA_CPP_STORAGE.prepare_unload_mode(
+                selected_unload_mode,
+                config,
+            )
+
+            return self._process_impl(
+                llama_model=llama_model,
+                preset_prompt=preset_prompt,
+                custom_prompt=custom_prompt,
+                system_prompt=system_prompt,
+                inference_mode=inference_mode,
+                max_frames=max_frames,
+                seed=seed,
+                save_states=save_states,
+                unique_id=unique_id,
+                parameters=parameters,
+                images=images,
+                queue_handler=queue_handler,
+                **kwargs,
+            )
+
+        finally:
+            try:
+                LLAMA_CPP_STORAGE.finish_unload_mode(
+                    selected_unload_mode,
+                )
+            except Exception as error:
+                print(
+                    "[llama-cpp_vlm] "
+                    f"运行后清理模型时出现提示：{error}"
+                )
+
+            gc.collect()
+
+    def _process_impl(
+        self,
+        llama_model,
+        preset_prompt,
+        custom_prompt,
+        system_prompt,
+        inference_mode,
+        max_frames,
+        seed,
+        save_states,
+        unique_id=-1,
+        parameters=None,
+        images=None,
+        queue_handler=None,
+        **kwargs,
+    ):
+        # ---------------------------------------------------------
+        # 1. 解包 INPUT_IS_LIST=True 产生的普通参数
+        # ---------------------------------------------------------
+        llama_model = self._first(llama_model)
+        preset_prompt = self._first(
+            preset_prompt,
+            preset_tags[1],
+        )
+        custom_prompt = self._first(
+            custom_prompt,
+            "",
+        )
+        system_prompt = self._first(
+            system_prompt,
+            "",
+        )
+        inference_mode = self._first(
+            inference_mode,
+            "one by one",
+        )
+        max_frames = int(
+            self._first(
+                max_frames,
+                24,
+            )
+        )
+        seed = int(
+            self._first(
+                seed,
+                0,
+            )
+        )
+        save_states = bool(
+            self._first(
+                save_states,
+                False,
+            )
+        )
+        unique_id = self._first(
+            unique_id,
+            -1,
+        )
+
+        if isinstance(parameters, list):
+            parameters = parameters[0] if parameters else None
+
         if parameters is None:
             parameters = {}
-            
-        if _MTMD:
-            parameters.pop("present_penalty", None)
-            
-        _uid = parameters.get("state_uid", None)
-        _parameters = parameters.copy()
-        _parameters.pop("state_uid", None)
-        uid = str(unique_id).rpartition('.')[-1] if _uid in (None, -1) else str(_uid)
-        
-        last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
-        video_input = inference_mode == "video"
-        system_prompts = "请将输入的图片序列当做视频而不是静态帧序列, " + system_prompt if video_input else system_prompt
-        
-        if last_sys_prompt != system_prompts:
-            messages = []
-            LLAMA_CPP_STORAGE.clean_state(uid)
-            LLAMA_CPP_STORAGE.sys_prompts[f"{uid}"] = system_prompts
-            if system_prompts.strip():
-                messages.append({"role": "system", "content": system_prompts})
-        else:
-            if save_states:
-                try:
-                    print(f"[llama-cpp_vlm] Loading state and history id={uid}...")
-                    messages = LLAMA_CPP_STORAGE.messages.get(f"{uid}", [])
-                except Exception:
-                    messages = []
-            else:
-                messages = []
-                
-        out1 = ""
-        out2 = []
-        user_content = []
-        if custom_prompt.strip() and "*" not in preset_prompt:
-            user_content.append({"type": "text", "text": custom_prompt})
-        else:
-            p = preset_prompts[preset_prompt].replace("#", custom_prompt.strip()).replace("@", "video" if video_input else "image")
-            user_content.append({"type": "text", "text": p})
-            
-        # 过滤并按 list 里的每个 item 整理图片（保持 list 的每个 item 独立性）
-        raw_image_list = [img for img in images if img is not None] if images is not None else []
-        
-        if raw_image_list:
-            curr_mmproj = LLAMA_CPP_STORAGE.current_config.get("mmproj") if LLAMA_CPP_STORAGE.current_config else None
-            if LLAMA_CPP_STORAGE.chat_handler is None or curr_mmproj in [None, "None"]:
-                raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
-                
-            # image_groups[i] 对应输入 list 里的第 i 个 item (可能包含单帧或 Batch 多帧)
-            image_groups = []
-            for img_item in raw_image_list:
-                if img_item.ndim == 3:
-                    image_groups.append([img_item])
-                elif img_item.ndim == 4:
-                    image_groups.append([img_item[i] for i in range(img_item.shape[0])])
-                    
-            # 1. ONE BY ONE 模式：遍历 list 里的每个 item，把该 item 里的所有图片放进同一次推理
-            if inference_mode == "one by one":
-                print(f"[llama-cpp_vlm] [One-by-One Mode] Processing {len(image_groups)} list items individually...")
-                tmp_list = []
-                
-                for item_idx, item_frames in enumerate(cqdm(image_groups)):
-                    if mm.processing_interrupted():
-                        raise mm.InterruptProcessingException()
-                        
-                    curr_user_content = json.loads(json.dumps(user_content))
-                    for frame in item_frames:
-                        if len(item_frames) > 1:
-                            data = image2base64(scale_image(frame, max_size))
-                        else:
-                            data = image2base64(np.clip(255.0 * frame.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                            
-                        curr_user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{data}"}
-                        })
-                        
-                    curr_messages = messages + [{"role": "user", "content": curr_user_content}]
-                    output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
-                    text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                    
-                    out2.append(text)
-                    if len(image_groups) > 1:
-                        tmp_list.append(f"====== Item {item_idx+1} ======")
-                    tmp_list.append(text)
-                    
-                out1 = "\n\n".join(tmp_list)
-                messages.append({"role": "user", "content": user_content})
-                
-            # 2. IMAGES 模式：打平 list 里的所有 item，把所有图片合并在 1 次推理中
-            elif inference_mode == "images":
-                all_frames = [frame for group in image_groups for frame in group]
-                print(f"[llama-cpp_vlm] [Images Mode] Packing ALL {len(all_frames)} images into 1 single completion...")
-                
-                for frame in all_frames:
-                    if len(all_frames) > 1:
-                        data = image2base64(scale_image(frame, max_size))
-                    else:
-                        data = image2base64(np.clip(255.0 * frame.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{data}"}
-                    })
-                    
-                messages.append({"role": "user", "content": user_content})
-                output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-                raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                
-                # 使用正则剔除 <think>...</think> 及其包含的所有内容
-                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-                
-                out1 = clean_text
-                out2 = [out1]
-                
-            # 3. VIDEO 模式：把 list 里的每个 item 各自当成一个视频独立推理
-            elif inference_mode == "video":
-                print(f"[llama-cpp_vlm] [Video Mode] Processing {len(image_groups)} video clips...")
-                tmp_list = []
-                
-                for v_idx, video_frames in enumerate(cqdm(image_groups)):
-                    if mm.processing_interrupted():
-                        raise mm.InterruptProcessingException()
-                        
-                    indices = np.linspace(0, len(video_frames) - 1, min(len(video_frames), max_frames), dtype=int)
-                    sampled_frames = [video_frames[i] for i in indices]
-                    
-                    curr_user_content = json.loads(json.dumps(user_content))
-                    for frame in sampled_frames:
-                        data = image2base64(scale_image(frame, max_size))
-                        curr_user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{data}"}
-                        })
-                        
-                    curr_messages = messages + [{"role": "user", "content": curr_user_content}]
-                    output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
-                    text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                    
-                    out2.append(text)
-                    if len(image_groups) > 1:
-                        tmp_list.append(f"====== Video Clip {v_idx+1} ======")
-                    tmp_list.append(text)
-                    
-                out1 = "\n\n".join(tmp_list)
-                messages.append({"role": "user", "content": user_content})
-        else:
-            # 纯文本模式
-            text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
-            messages.append({"role": "user", "content": text_string})
-            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-            raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-            
-            # 使用正则剔除 <think>...</think> 及其包含的所有内容
-            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-            
-            out1 = clean_text
-            out2 = [out1]
-            
-        if save_states:
-            print(f"[llama-cpp_vlm] Saving state id={uid}...")
-            messages.append({"role": "assistant", "content": out1})
-            clear_message = self.sanitize_messages(messages)
-            LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
-        else:
-            LLAMA_CPP_STORAGE.clean_state(uid)
-        
-        if force_offload:
-            LLAMA_CPP_STORAGE.clean()
-        else:
-            if LLAMA_CPP_STORAGE.current_config and LLAMA_CPP_STORAGE.current_config["chat_handler"] in [
-                "Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking", "Qwen3.8", "Qwen3.8-Thinking"
-            ]:
-                LLAMA_CPP_STORAGE.llm.n_tokens = 0
-                LLAMA_CPP_STORAGE.llm._ctx.memory_clear(True)
-                if LLAMA_CPP_STORAGE.llm.is_hybrid and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
-                    LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
-                    
-        del messages
-        gc.collect()
-        return (out1, out2, uid)
 
+        parameters = dict(parameters)
+
+        # state_uid 不是 llama.cpp 的推理参数。
+        state_uid = parameters.pop(
+            "state_uid",
+            None,
+        )
+
+        if _MTMD:
+            # MTMD Handler 不接受 present_penalty。
+            parameters.pop(
+                "present_penalty",
+                None,
+            )
+
+        # 限制 seed 范围。
+        seed = max(
+            0,
+            min(
+                0xFFFFFFFFFFFFFFFF,
+                seed,
+            ),
+        )
+
+        # ---------------------------------------------------------
+        # 2. 确保当前加载的模型与输入模型一致
+        # ---------------------------------------------------------
+        if (
+            not LLAMA_CPP_STORAGE.llm
+            or LLAMA_CPP_STORAGE.current_config != llama_model
+        ):
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+
+        # Instruct 模式需要关闭 embeddings。
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
+
+        # ---------------------------------------------------------
+        # 3. 建立对话状态 ID
+        # ---------------------------------------------------------
+        if state_uid in (None, -1):
+            uid = str(unique_id).rpartition(".")[-1]
+        else:
+            uid = str(state_uid)
+
+        last_system_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(
+            uid,
+            None,
+        )
+
+        video_input = inference_mode == "video"
+
+        if video_input:
+            effective_system_prompt = (
+                "请将输入的图片序列当做视频，而不是静态帧序列。"
+                + str(system_prompt or "")
+            )
+        else:
+            effective_system_prompt = str(
+                system_prompt or ""
+            )
+
+        if last_system_prompt != effective_system_prompt:
+            messages = []
+
+            LLAMA_CPP_STORAGE.clean_state(uid)
+
+            LLAMA_CPP_STORAGE.sys_prompts[uid] = (
+                effective_system_prompt
+            )
+
+            if effective_system_prompt.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": effective_system_prompt,
+                    }
+                )
+
+        elif save_states:
+            print(
+                f"[llama-cpp_vlm] Loading state and history id={uid}..."
+            )
+
+            saved_messages = LLAMA_CPP_STORAGE.messages.get(
+                uid,
+                [],
+            )
+
+            # 深拷贝，避免本轮修改全局状态。
+            messages = json.loads(
+                json.dumps(saved_messages)
+            )
+
+        else:
+            messages = []
+
+        # 保存本轮实际产生的 user/assistant 消息。
+        history_messages = []
+
+        output_list = []
+
+        # ---------------------------------------------------------
+        # 4. 构建基础文本提示词
+        # ---------------------------------------------------------
+        if (
+            str(custom_prompt or "").strip()
+            and "*" not in str(preset_prompt)
+        ):
+            prompt_text = str(custom_prompt)
+
+        else:
+            if preset_prompt not in preset_prompts:
+                raise ValueError(
+                    f'Unknown preset prompt: "{preset_prompt}"'
+                )
+
+            prompt_text = preset_prompts[preset_prompt]
+
+            prompt_text = prompt_text.replace(
+                "#",
+                str(custom_prompt or "").strip(),
+            )
+
+            prompt_text = prompt_text.replace(
+                "@",
+                "video" if video_input else "image",
+            )
+
+        base_user_content = [
+            {
+                "type": "text",
+                "text": prompt_text,
+            }
+        ]
+
+        # ---------------------------------------------------------
+        # 5. 收集多图输入
+        # ---------------------------------------------------------
+        #
+        # images 是第一个接口。
+        # images_02 到 images_10 位于 kwargs 中。
+        #
+        # collect_instruct_images() 会保留每个输入 Tensor 的边界：
+        #
+        # 单图：
+        #     [H, W, C] -> 一个图像组
+        #
+        # Batch：
+        #     [B, H, W, C] -> 一个包含 B 帧的图像组
+        #
+        raw_image_inputs = collect_instruct_images(
+            images=images,
+            extra_inputs=kwargs,
+        )
+
+        image_groups = []
+
+        for image_input in raw_image_inputs:
+            if image_input.ndim == 3:
+                image_groups.append(
+                    [image_input]
+                )
+
+            elif image_input.ndim == 4:
+                frames = [
+                    image_input[index]
+                    for index in range(image_input.shape[0])
+                ]
+
+                if frames:
+                    image_groups.append(frames)
+
+        # ---------------------------------------------------------
+        # 6. 图像推理
+        # ---------------------------------------------------------
+        if image_groups:
+            current_config = (
+                LLAMA_CPP_STORAGE.current_config
+                or {}
+            )
+
+            current_mmproj = current_config.get(
+                "mmproj"
+            )
+
+            if (
+                LLAMA_CPP_STORAGE.chat_handler is None
+                or current_mmproj in (
+                    None,
+                    "",
+                    "None",
+                )
+            ):
+                raise ValueError(
+                    "检测到图像输入，但当前模型没有配置 mmproj。"
+                )
+
+            # =====================================================
+            # one by one
+            # =====================================================
+            if inference_mode == "one by one":
+                print(
+                    "[llama-cpp_vlm] "
+                    f"[One-by-One Mode] Processing "
+                    f"{len(image_groups)} image groups..."
+                )
+
+                result_parts = []
+
+                for group_index, frames in enumerate(
+                    cqdm(image_groups)
+                ):
+                    if mm.processing_interrupted():
+                        raise mm.InterruptProcessingException()
+
+                    current_user_content = json.loads(
+                        json.dumps(base_user_content)
+                    )
+
+                    for frame in frames:
+                        self._append_frame(
+                            current_user_content,
+                            frame,
+                        )
+
+                    current_messages = messages + [
+                        {
+                            "role": "user",
+                            "content": current_user_content,
+                        }
+                    ]
+
+                    result = self._create_completion(
+                        current_messages,
+                        seed,
+                        parameters,
+                    )
+
+                    raw_text = (
+                        result["choices"][0]["message"].get(
+                            "content",
+                            "",
+                        )
+                    )
+
+                    text = self._remove_thinking(
+                        raw_text
+                    )
+
+                    output_list.append(text)
+
+                    if len(image_groups) > 1:
+                        result_parts.append(
+                            f"====== Item {group_index + 1} ======"
+                        )
+
+                    result_parts.append(text)
+
+                    if save_states:
+                        history_messages.extend(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": current_user_content,
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": text,
+                                },
+                            ]
+                        )
+
+                output = "\n\n".join(
+                    result_parts
+                )
+
+            # =====================================================
+            # images
+            # =====================================================
+            elif inference_mode == "images":
+                all_frames = [
+                    frame
+                    for group in image_groups
+                    for frame in group
+                ]
+
+                if not all_frames:
+                    raise ValueError(
+                        "images 模式没有收到有效图片。"
+                    )
+
+                print(
+                    "[llama-cpp_vlm] "
+                    f"[Images Mode] Packing "
+                    f"{len(all_frames)} images into one completion..."
+                )
+
+                combined_user_content = json.loads(
+                    json.dumps(base_user_content)
+                )
+
+                for frame in all_frames:
+                    self._append_frame(
+                        combined_user_content,
+                        frame,
+                    )
+
+                current_messages = messages + [
+                    {
+                        "role": "user",
+                        "content": combined_user_content,
+                    }
+                ]
+
+                result = self._create_completion(
+                    current_messages,
+                    seed,
+                    parameters,
+                )
+
+                raw_text = (
+                    result["choices"][0]["message"].get(
+                        "content",
+                        "",
+                    )
+                )
+
+                output = self._remove_thinking(
+                    raw_text
+                )
+
+                output_list = [output]
+
+                if save_states:
+                    history_messages.extend(
+                        [
+                            {
+                                "role": "user",
+                                "content": combined_user_content,
+                            },
+                            {
+                                "role": "assistant",
+                                "content": output,
+                            },
+                        ]
+                    )
+
+            # =====================================================
+            # video
+            # =====================================================
+            elif inference_mode == "video":
+                print(
+                    "[llama-cpp_vlm] "
+                    f"[Video Mode] Processing "
+                    f"{len(image_groups)} video clips..."
+                )
+
+                result_parts = []
+
+                for video_index, frames in enumerate(
+                    cqdm(image_groups)
+                ):
+                    if mm.processing_interrupted():
+                        raise mm.InterruptProcessingException()
+
+                    if not frames:
+                        continue
+
+                    frame_count = min(
+                        len(frames),
+                        max_frames,
+                    )
+
+                    indices = np.linspace(
+                        0,
+                        len(frames) - 1,
+                        frame_count,
+                        dtype=int,
+                    )
+
+                    sampled_frames = [
+                        frames[index]
+                        for index in indices
+                    ]
+
+                    current_user_content = json.loads(
+                        json.dumps(base_user_content)
+                    )
+
+                    for frame in sampled_frames:
+                        self._append_frame(
+                            current_user_content,
+                            frame,
+                        )
+
+                    current_messages = messages + [
+                        {
+                            "role": "user",
+                            "content": current_user_content,
+                        }
+                    ]
+
+                    result = self._create_completion(
+                        current_messages,
+                        seed,
+                        parameters,
+                    )
+
+                    raw_text = (
+                        result["choices"][0]["message"].get(
+                            "content",
+                            "",
+                        )
+                    )
+
+                    text = self._remove_thinking(
+                        raw_text
+                    )
+
+                    output_list.append(text)
+
+                    if len(image_groups) > 1:
+                        result_parts.append(
+                            f"====== Video Clip {video_index + 1} ======"
+                        )
+
+                    result_parts.append(text)
+
+                    if save_states:
+                        history_messages.extend(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": current_user_content,
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": text,
+                                },
+                            ]
+                        )
+
+                output = "\n\n".join(
+                    result_parts
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown inference mode: {inference_mode}"
+                )
+
+        # ---------------------------------------------------------
+        # 7. 纯文本推理
+        # ---------------------------------------------------------
+        else:
+            text_string = "".join(
+                item["text"]
+                for item in base_user_content
+                if item.get("type") == "text"
+            )
+
+            current_messages = messages + [
+                {
+                    "role": "user",
+                    "content": text_string,
+                }
+            ]
+
+            result = self._create_completion(
+                current_messages,
+                seed,
+                parameters,
+            )
+
+            raw_text = (
+                result["choices"][0]["message"].get(
+                    "content",
+                    "",
+                )
+            )
+
+            output = self._remove_thinking(
+                raw_text
+            )
+
+            output_list = [output]
+
+            if save_states:
+                history_messages.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": text_string,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": output,
+                        },
+                    ]
+                )
+
+        # ---------------------------------------------------------
+        # 8. 保存或清理状态
+        # ---------------------------------------------------------
+        if save_states:
+            print(
+                f"[llama-cpp_vlm] Saving state id={uid}..."
+            )
+
+            messages.extend(history_messages)
+
+            LLAMA_CPP_STORAGE.messages[uid] = (
+                self.sanitize_messages(messages)
+            )
+        else:
+            LLAMA_CPP_STORAGE.clean_state(uid)
+
+        # 模型缓存清理和卸载统一由外层 process() 的 finally 执行。
+        return (
+            output,
+            output_list,
+            int(uid),
+        )
+        
 class llama_cpp_parameters:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 1}),
-                "top_k": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "present_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2, "step": 1}),
-                "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 1, "tooltip": "最大生成 Token 数。"}),
+                "top_k": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1, "tooltip": "Top-K 采样范围。0 表示不限制。"}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "核采样概率。数值越低，输出越保守。"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01,  "tooltip": "最小概率采样阈值。"}),
+                "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,  "tooltip": "Typical-P 采样参数。"}),
+                "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 2.0, "step": 0.01,  "tooltip": "温度参数 越高越随机，越低越稳定。"}),
+                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,  "tooltip": "重复惩罚系数。"}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,  "tooltip": "频率惩罚，抑制重复出现的词元。"}),
+                "present_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01,  "tooltip": "存在惩罚，鼓励模型使用新的词元。"}),
+                "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2, "step": 1,  "tooltip": "Mirostat 模式 0=关闭，1/2=启用不同版本。"}),
+                "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,  "tooltip": "Mirostat 学习率。"}),
+                "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01,  "tooltip": "Mirostat 目标熵。"}),
                 "state_uid": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "Use a specific ID to save the conversation state.\n(-1 = use node's unique_id)"
+                    "tooltip": "对话状态 ID  -1：使用当前节点的唯一 ID  指定其他数值：多个节点可以共享同一个对话状态"
                 }),
             }
         }
@@ -797,7 +2130,7 @@ class llama_cpp_clean_states:
                 "any": (any_type,),
                 "state_uid": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "Clear the saved state for a specific ID (-1 = clear all)"
+                    "tooltip": "清除指定的文本对话状态 (-1：清除全部状态)"
                 }),
             },
         }
@@ -837,7 +2170,7 @@ class json_to_bbox:
                 "label": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "Select only the BBoxes with specific labels."
+                    "tooltip": "只输出指定标签对应的边界框 留空时输出全部边界框."
                 }),
             },
             "optional": {
@@ -1113,7 +2446,7 @@ class bboxes_to_bbox:
                     "min": -998,
                     "max": 999,
                     "step": 1,
-                    "tooltip": "BBox index in the image. Set to 999 to get all bboxes."
+                    "tooltip": "图像中的 BBox 索引。设置为 999 以获取所有 BBox。."
                 }),
             }
         }
@@ -1543,17 +2876,17 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "llama_cpp_model_loader": "Llama-cpp Model Loader",
-    "llama_cpp_instruct_adv": "Llama-cpp Instruct",
-    "llama_cpp_parameters": "Llama-cpp Parameters",
-    "llama_cpp_unload_model": "Llama-cpp Unload Model",
-    "llama_cpp_clean_states": "Llama-cpp Clean States",
-    "parse_json_node": "Parse JSON",
-    "json_to_bbox": "JSON to BBoxes",
-    "bbox_to_segs": "BBoxes to SEGS",
-    "bbox_to_mask": "BBoxes to MASK",
-    "bboxes_to_bbox": "BBoxes to BBox",
-    "remove_code_block": "Unpack Code Block",
-    "PromptEnhancerPreset": "Prompt Enhancer Preset",
-    "llama_cpp_text_encoder": "Llama-cpp Text Encoder (BETA)",
+    "llama_cpp_model_loader": "Llama-cpp 模型加载器",
+    "llama_cpp_instruct_adv": "Llama-cpp 图像/文本指令",
+    "llama_cpp_parameters": "Llama-cpp 推理参数",
+    "llama_cpp_unload_model": "Llama-cpp 卸载模型",
+    "llama_cpp_clean_states": "Llama-cpp 清理对话状态",
+    "parse_json_node": "解析 JSON",
+    "json_to_bbox": "JSON 转边界框",
+    "bbox_to_segs": "边界框转 SEGS",
+    "bbox_to_mask": "边界框转 MASK",
+    "bboxes_to_bbox": "选择边界框",
+    "remove_code_block": "移除代码块标记",
+    "PromptEnhancerPreset": "提示词增强预设",
+    "llama_cpp_text_encoder": "Llama-cpp 文本编码器（测试版）",
 }
