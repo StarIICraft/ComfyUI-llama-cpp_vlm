@@ -3,7 +3,8 @@
 在 ComfyUI 中运行本地 LLM/VLM，并调用 OpenAI 兼容 API。
 
 **[English](./README.md)**
-<img width="1980" height="1888" alt="image" src="https://github.com/user-attachments/assets/316cacab-98f9-4367-80d6-67640c2106bf" />
+
+<img width="1976" height="1654" alt="image" src="https://github.com/user-attachments/assets/da9176a2-f451-4a64-86c1-9889a1cbb551" />
 
 ## 功能
 
