@@ -16,7 +16,7 @@ This branch includes:
 
 ## Preview
 
-<img width="1887" height="1631" alt="image" src="https://github.com/user-attachments/assets/5729dde2-8336-4f87-8c4d-188351f7c734" />
+<img width="1996" height="1624" alt="image" src="https://github.com/user-attachments/assets/caf29289-791c-433a-a78e-b5fd9e85ef7d" />
 <img width="1880" height="1879" alt="api图像编辑-生成与多图统一缩放" src="https://github.com/user-attachments/assets/76af5597-4ad0-4b09-802f-f505be0bc98d" />
 
 
