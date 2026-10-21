@@ -11,8 +11,6 @@ This branch includes:
 - Universal API image generation and editing with up to 8 reference images.
 - Multi-image resizing with 8 independent image inputs and outputs, image 1 mask processing, aspect-ratio padding, and resolution controls.
 
-- 
-<img width="1976" height="1654" alt="image" src="https://github.com/user-attachments/assets/20d16bea-db9e-462d-98b4-ae817512d307" />
 
 **[[📃中文版](./README_zh.md)]**
 
