@@ -293,8 +293,20 @@ def area_resize(
     interpolation,
     force=False,
 ):
-    # 上限模式下，未超限图片保持原尺寸。
-    if not force and image.width * image.height <= area:
+    # 未超过面积上限且已经满足整除要求时，保持原尺寸。
+    already_aligned = (
+        divisor <= 1
+        or (
+            image.width % divisor == 0
+            and image.height % divisor == 0
+        )
+    )
+
+    if (
+        not force
+        and image.width * image.height <= area
+        and already_aligned
+    ):
         return image, mask
 
     size = fit_area(
@@ -304,7 +316,13 @@ def area_resize(
         force,
         divisor,
     )
-    return resize_pair(image, mask, size, interpolation)
+
+    return resize_pair(
+        image,
+        mask,
+        size,
+        interpolation,
+    )
 
 
 def place_on_canvas(
@@ -533,12 +551,41 @@ def masks_to_tensor(masks):
     return result
 
 
+def combine_preview(outputs, color):
+    images = []
+
+    for output in outputs:
+        if output is None:
+            continue
+
+        for frame in output:
+            array = frame.detach().cpu().float().numpy()
+            array = np.nan_to_num(array, nan=0, posinf=1, neginf=0)
+            array = (np.clip(array, 0, 1) * 255 + 0.5).astype(np.uint8)
+            images.append(Image.fromarray(array, "RGB"))
+
+    if not images:
+        return torch.empty((0, 1, 1, 3), dtype=torch.float32)
+
+    width = max(image.width for image in images)
+    height = max(image.height for image in images)
+    canvas_images = []
+
+    for image in images:
+        canvas = Image.new("RGB", (width, height), color)
+        left = (width - image.width) // 2
+        top = (height - image.height) // 2
+        canvas.paste(image, (left, top))
+        canvas_images.append(canvas)
+
+    return images_to_tensor(canvas_images)
+
+
 class GoohaiMultiImageResize:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image_1": ("IMAGE",),
                 "language": (
                     ["中文", "English"],
                     {"default": "中文"},
@@ -608,6 +655,7 @@ class GoohaiMultiImageResize:
                 }),
             },
             "optional": {
+                "image_1": ("IMAGE",),
                 **{
                     f"image_{index}": ("IMAGE",)
                     for index in range(2, 9)
@@ -620,6 +668,7 @@ class GoohaiMultiImageResize:
         "IMAGE", "IMAGE", "IMAGE", "IMAGE",
         "IMAGE", "IMAGE", "IMAGE", "IMAGE",
         "MASK", "MASK", "INT", "INT", "STRING",
+        "IMAGE",
     )
 
     RETURN_NAMES = (
@@ -636,6 +685,7 @@ class GoohaiMultiImageResize:
         "图1宽度 / Width 1",
         "图1高度 / Height 1",
         "执行报告 / Report",
+        "多图预览 / Combined preview",
     )
 
     FUNCTION = "resize"
@@ -643,7 +693,6 @@ class GoohaiMultiImageResize:
 
     def resize(
         self,
-        image_1,
         language,
         resize_mode,
         megapixels,
@@ -659,11 +708,33 @@ class GoohaiMultiImageResize:
         resize_method,
         interpolation,
         divisor,
+        image_1=None,
         mask_1=None,
         **kwargs,
     ):
         check_interrupt()
         chinese = language != "English"
+
+        inputs = [image_1] + [
+            kwargs.get(f"image_{index}")
+            for index in range(2, 9)
+        ]
+
+        # 图1是后续缩放规则的参考输入；缺失时返回空结果，避免校验时报错。
+        if image_1 is None:
+            empty_images = torch.empty((0, 1, 1, 3), dtype=torch.float32)
+            empty_masks = torch.empty((0, 1, 1), dtype=torch.float32)
+            empty_preview = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            report = (
+                "没有图1输入，输出为空。"
+                if chinese else
+                "Image 1 is missing; outputs are empty."
+            )
+            return (
+                empty_images, empty_images, empty_images, empty_images,
+                empty_images, empty_images, empty_images, empty_images,
+                empty_masks, empty_masks, 0, 0, report, empty_preview,
+            )
 
         if resize_mode not in MODES:
             raise ValueError(
@@ -763,11 +834,6 @@ class GoohaiMultiImageResize:
             else COLOR_PRESETS[color_preset]
         )
 
-        inputs = [first_tensor] + [
-            kwargs.get(f"image_{index}")
-            for index in range(2, 9)
-        ]
-
         outputs = [None] * MAX_IMAGES
         reports = []
         first_masks = []
@@ -803,6 +869,24 @@ class GoohaiMultiImageResize:
                 check_interrupt()
 
                 image = tensor_to_pil(frame, color)
+
+                # 对图1逐张判断：未输入遮罩或原始遮罩全为0，
+                # 则在最终处理完成后输出纯白遮罩。
+                # 在遮罩缩放前检测，不要求其分辨率与图1一致。
+                force_white_mask = False
+
+                if slot == 0:
+                    if masks is None:
+                        force_white_mask = True
+                    else:
+                        mask_index = (
+                            0 if masks.shape[0] == 1 else index
+                        )
+                        source_mask = masks[mask_index]
+                        force_white_mask = (
+                            torch.count_nonzero(source_mask).item() == 0
+                        )
+
                 mask = (
                     mask_to_pil(masks, index, image.size)
                     if slot == 0 else None
@@ -840,7 +924,6 @@ class GoohaiMultiImageResize:
                         force = False
 
                     elif resize_mode == MODE_LIMIT and slot > 0:
-                        # 统一百万像素模式：
                         # 其他图片按图1面积乘数和百万像素上限中的较小值缩小。
                         area = min(
                             limit_area,
@@ -862,8 +945,9 @@ class GoohaiMultiImageResize:
                     )
                     padding = Image.new("L", image.size, 0)
 
-                if slot == 0 and mask_1 is None:
-                    # 无输入遮罩时，最终图1遮罩始终为纯白。
+                if slot == 0 and force_white_mask:
+                    # 使用最终图像尺寸生成纯白遮罩，
+                    # 同时覆盖缩放、裁剪和填充后的结果。
                     mask = Image.new("L", image.size, 255)
 
                 processed.append(image)
@@ -945,20 +1029,26 @@ class GoohaiMultiImageResize:
 
         if divisor > 1:
             reports.append(
-                "整除数仅在缩放或填充时应用；"
-                "百万像素上限内未超限图片保持尺寸不变。"
+                "整除数仅在必要时调整尺寸；"
+                "未超出百万像素上限但宽高不满足整除要求时，"
                 if chinese else
-                "Divisor applies during resizing or padding; "
-                "under-limit images keep their original dimensions."
+                "The divisor is applied when needed; images below "
+                "the megapixel limit are still adjusted downward "
+                "if their dimensions are not divisible by the divisor."
             )
 
-        if mask_1 is None:
-            reports.append(
-                "未输入图1遮罩：图1遮罩输出为纯白色；拓展遮罩独立计算。"
-                if chinese else
-                "No input mask: image 1 mask output is white; "
-                "padding mask is calculated separately."
-            )
+        reports.append(
+            "图1遮罩逐张处理：未输入或原始遮罩为纯黑时，"
+            "输出与最终图1尺寸一致的纯白遮罩；"
+            "其他遮罩正常变换；拓展遮罩独立计算。"
+            if chinese else
+            "Image 1 masks are handled per frame: missing or "
+            "all-zero source masks produce white masks matching "
+            "the final image size; other masks transform normally. "
+            "Padding masks are calculated separately."
+        )
+
+        preview = combine_preview(outputs, color)
 
         return tuple(outputs) + (
             masks_to_tensor(first_masks),
@@ -966,6 +1056,7 @@ class GoohaiMultiImageResize:
             first_width,
             first_height,
             "\n".join(reports),
+            preview,
         )
 
 
