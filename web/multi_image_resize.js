@@ -38,6 +38,7 @@ const OUTPUT_LABELS = [
     ["图1宽度", "Image 1 width"],
     ["图1高度", "Image 1 height"],
     ["执行报告", "Report"],
+    ["多图预览", "Combined preview"],
 ];
 
 const widgetStates = new WeakMap();
